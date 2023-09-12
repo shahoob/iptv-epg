@@ -1,10 +1,10 @@
 const { program } = require('commander')
 const _ = require('lodash')
-const { EPGGrabber, generateXMLTV, Channel, Program } = require('epg-grabber')
-const { db, logger, date, timer, file, parser, api, zip } = require('../../core')
-const path = require('path')
+const { EPGGrabber, generateXMLTV, Program } = require('epg-grabber')
+const { logger: _logger, date, timer, file, parser, api, zip } = require('../../core')
 const dayjs = require('dayjs')
 const utc = require('dayjs/plugin/utc')
+const { Listr, ListrLogger, ListrLogLevels, ListrDefaultRendererLogLevels, color, VerboseRenderer } = require('listr2')
 const CronJob = require('cron').CronJob
 
 dayjs.extend(utc)
@@ -26,16 +26,27 @@ options.output = options.output || file.resolve(`${BASE_DIR}/guides/{lang}/{site
 options.config = file.resolve(`${BASE_DIR}/sites/${options.site}/${options.site}.config.js`)
 options.channels = file.resolve(`${BASE_DIR}/sites/${options.site}/${options.site}*.channels.xml`)
 
-let channels = []
-let programs = []
 let runIndex = 0
+const logger = new ListrLogger({
+  useIcons: true,
+  icon: {
+    [ListrDefaultRendererLogLevels.COMPLETED]: 'completed ✔',
+    [ListrDefaultRendererLogLevels.FAILED]:    'failed    ✖',
+    [ListrDefaultRendererLogLevels.OUTPUT]:    'info      ℹ'
+  },
+  color: {
+    [ListrDefaultRendererLogLevels.OUTPUT]: color.cyan,
+    [ListrDefaultRendererLogLevels.FAILED]: color.red,
+    [ListrDefaultRendererLogLevels.COMPLETED]: color.green
+  }
+})
 
 async function main() {
-  logger.start('staring...')
+  logger.log(ListrLogLevels.STARTED, 'starting...')
 
-  logger.info('settings:')
+  logger.log(ListrLogLevels.OUTPUT, 'settings:')
   for (let prop in options) {
-    logger.info(`  ${prop}: ${options[prop]}`)
+    logger.log(ListrLogLevels.OUTPUT, `  ${prop}: ${options[prop]}`)
   }
 
   const config = await loadConfig(options.config)
@@ -57,7 +68,7 @@ async function loadConfig(configPath) {
   config = _.merge(config, {})
   config.days = config.days || 1
 
-  logger.info('config:')
+  logger.log(ListrLogLevels.OUTPUT, 'config:')
   logConfig(config)
 
   return config
@@ -67,10 +78,11 @@ function logConfig(config, level = 1) {
   let padLeft = '  '.repeat(level)
   for (let prop in config) {
     if (typeof config[prop] === 'string' || typeof config[prop] === 'number') {
-      logger.info(`${padLeft}${prop}: ${config[prop]}`)
+      // logger.info(`${padLeft}${prop}: ${config[prop]}`)
+      logger.log(ListrLogLevels.OUTPUT, `${padLeft}${prop}: ${config[prop]}`)
     } else if (typeof config[prop] === 'object') {
       level++
-      logger.info(`${padLeft}${prop}:`)
+      logger.log(ListrLogLevels.OUTPUT, `${padLeft}${prop}:`)
       logConfig(config[prop], level)
     }
   }
@@ -78,20 +90,36 @@ function logConfig(config, level = 1) {
 
 async function runJob(config, queue, outputPath) {
   runIndex++
-  logger.info(`run #${runIndex}:`)
+  logger.log(ListrLogLevels.STARTED, `run #${runIndex}:`)
+
+  const listr = new Listr([
+    { title: 'Grab channels', task: async (ctx, task) => {
+      task.title = 'Grabbing channels...'
+      const [channels, programs] = await grab(queue, config, task)
+      ctx.channels = channels
+      ctx.programs = programs
+    } },
+    { title: 'Save to XMLTV', task: async (ctx, task) => {
+      task.title = 'Saving to XMLTV...'
+      await save(outputPath, ctx.channels, ctx.programs, task)
+    } }
+  ], {concurrent: false})
 
   timer.start()
 
-  await grab(queue, config)
-
-  await save(outputPath, channels, programs)
-
-  logger.success(`  done in ${timer.format('HH[h] mm[m] ss[s]')}`)
+  await listr.run()
+  
+  logger.log(ListrLogLevels.COMPLETED, `  done in ${timer.format('HH[h] mm[m] ss[s]')}`)
 }
 
-async function grab(queue, config) {
+async function grab(queue, config, task) {
   const grabber = new EPGGrabber(config)
   const total = queue.length
+
+  task.output = 'Grabbing first channel...'
+
+  const channels = []
+  let programs = []
 
   let i = 1
   for (const item of queue) {
@@ -100,35 +128,33 @@ async function grab(queue, config) {
     channels.push(item.channel)
     await grabber
       .grab(channel, date, (data, err) => {
-        logger.info(
-          `  [${i}/${total}] ${channel.site} (${channel.lang}) - ${channel.xmltv_id} - ${dayjs
-            .utc(data.date)
-            .format('MMM D, YYYY')} (${data.programs.length} programs)`
-        )
+        task.output = `  [${i}/${total}] ${channel.site} (${channel.lang}) - ${channel.xmltv_id} - ${dayjs
+          .utc(data.date)
+          .format('MMM D, YYYY')} (${data.programs.length} programs)`
         if (i < total) i++
 
         if (err) {
-          logger.info(`    ERR: ${err.message}`)
+          logger.log(ListrLogLevels.FAILED, `    ERR: ${err.message}`)
         }
       })
       .then(results => {
         programs = programs.concat(results)
       })
   }
+
+  return [channels, programs]
 }
 
 async function createQueue(channelsPath, config) {
-  logger.info('creating queue...')
+  logger.log(ListrLogLevels.OUTPUT, 'creating queue...')
   let queue = {}
   await api.channels.load().catch(logger.error)
   const files = await file.list(channelsPath).catch(logger.error)
   const utcDate = date.getUTC(CURR_DATE)
   for (const filepath of files) {
-    logger.info(`  loading "${filepath}"...`)
+    logger.log(ListrLogLevels.OUTPUT, `  loading "${filepath}"...`)
     try {
-      const dir = file.dirname(filepath)
       const { channels } = await parser.parseChannels(filepath)
-      const filename = file.basename(filepath)
       const dates = Array.from({ length: config.days }, (_, i) => utcDate.add(i, 'd'))
       for (const channel of channels) {
         if (!channel.site || !channel.xmltv_id) continue
@@ -158,12 +184,12 @@ async function createQueue(channelsPath, config) {
 
   queue = Object.values(queue)
 
-  logger.info(`  added ${queue.length} items`)
+  logger.log(ListrLogLevels.COMPLETED, `  added ${queue.length} items`)
 
   return queue
 }
 
-async function save(template, parsedChannels, programs = []) {
+async function save(template, parsedChannels, programs = [], task) {
   const variables = file.templateVariables(template)
 
   const groups = _.groupBy(parsedChannels, channel => {
@@ -203,13 +229,13 @@ async function save(template, parsedChannels, programs = []) {
     const outputPath = file.templateFormat(template, output.channels[0])
     const xmlFilepath = outputPath
     const xmltv = generateXMLTV(output)
-    logger.info(`  saving to "${xmlFilepath}"...`)
+    task.output = `  saving to "${xmlFilepath}"...`
     await file.create(xmlFilepath, xmltv)
 
     if (options.gzip) {
       const gzFilepath = `${outputPath}.gz`
       const compressed = await zip.compress(xmltv)
-      logger.info(`  saving to "${gzFilepath}"...`)
+      task.output = `  saving to "${gzFilepath}"...`
       await file.create(gzFilepath, compressed)
     }
   }
