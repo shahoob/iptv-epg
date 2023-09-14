@@ -17,7 +17,7 @@ program
   .option('-l, --lang <code>', 'Filter channels by language (ISO 639-2 code)')
   .option('-o, --output <path>', 'Path to output file. Use commas (,) to separate multiple paths without a space in between. Must be the same order as the site names')
   .option('--cron <expression>', 'Schedule a script run')
-  .option('-c, --concurrcncy <value>', 'Number of concurrent tasks', 3)
+  .option('-c, --concurrency <value>', 'Number of concurrent tasks', 3)
   .option('--gzip', 'Create a compressed version of the guide as well', false)
   .parse(process.argv)
 
@@ -27,7 +27,7 @@ const sites = options.site.split(',')
 options.output = (options.output?.split(',') || null) || sites.map(site => file.resolve(`${BASE_DIR}/guides/{lang}/${site}.xml`))
 options.config = sites.map(site => file.resolve(`${BASE_DIR}/sites/${site}/${site}.config.js`))
 options.channels = sites.map(site => file.resolve(`${BASE_DIR}/sites/${site}/${site}*.channels.xml`))
-// options.concurrency = options.concurrency || 3
+options.concurrency = options.concurrency || 3
 
 let runIndex = 0
 const logger = new ListrLogger({
@@ -52,10 +52,14 @@ async function main() {
     logger.log(ListrLogLevels.OUTPUT, `  ${prop}: ${options[prop]}`)
   }
 
-  const configs = await Promise.all(options.config.map(config => loadConfig(config)))
-  const queues = await Promise.all(
-    options.channels.map((channel, i) => createQueue(channel, configs[i]))
-  )
+  const configs = []
+  const queues = []
+  for (const config of options.config) {
+    configs.push(await loadConfig(config))
+  }
+  for (const [i, channel] of options.channels.entries()) {
+    queues.push(await createQueue(channel, configs[i]))
+  }
 
   const sites_queues = _.zip(configs, queues, options.output, sites)
 
@@ -118,7 +122,7 @@ async function runJobs(sites_queues) {
         })
       )
     }
-  ], { concurrent: 3 })
+  ], { concurrent: Number(options.concurrency) })
 
   timer.start()
   await listr.run()
